@@ -33,10 +33,10 @@ jobs:
           HF_SPACE_ID: ${{ vars.HF_SPACE_ID }}
         run: |
           set -e
-          #if [ -z "$HF_TOKEN" ] || [ -z "$HF_SPACE_ID" ]; then
-            #echo "::error::Missing HF_TOKEN secret or HF_SPACE_ID variable. See setup notes in this file."
-            #exit 1
-          #fi
+          if [ -z "$HF_TOKEN" ] || [ -z "$HF_SPACE_ID" ]; then
+            echo "::error::Missing HF_TOKEN secret or HF_SPACE_ID variable. See setup notes in this file."
+            exit 1
+          fi
           HF_USER="${HF_SPACE_ID%%/*}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
