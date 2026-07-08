@@ -163,7 +163,7 @@ body::before {
     font-weight: 600;
 }
 
-.nav-link:hover, .nav-link.active-page {
+.nav-link.pill-active {
     color: var(--bg) !important; 
 }
 
@@ -525,7 +525,7 @@ function checkOverlay() {
     }
 }
 
-function showToast(message, type = 'info', title = '') {
+function showToast(message, type = 'info', title = '', duration = 2600) {
     const container = document.getElementById('toast-container');
     if (!container) return;
 
@@ -553,7 +553,7 @@ function showToast(message, type = 'info', title = '') {
         setTimeout(() => {
             if (toast.parentNode) toast.parentNode.removeChild(toast);
         }, 200);
-    }, 2600);
+    }, duration);
 }
 
 function escapeHtml(str) {
@@ -615,15 +615,13 @@ function movePill(el) {
     pill.style.height = r.height + "px";
     pill.style.left = (r.left - pr.left) + "px";
     pill.style.top = (r.top - pr.top) + "px";
+    links.forEach(l => l.classList.toggle("pill-active", l === el));
 }
 
 window.addEventListener('load', () => {
     const current = window.location.pathname;
     activeLink = [...links].find(l => l.getAttribute("href") === current) || links[0];
-    if(activeLink) {
-        activeLink.classList.add('active-page');
-        movePill(activeLink);
-    }
+    if(activeLink) movePill(activeLink);
 });
 
 links.forEach(l => {

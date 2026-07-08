@@ -1,13 +1,15 @@
 import asyncio
+import asyncio
 import json
+import os
 import random
 import secrets
+import shutil
 from datetime import datetime
 from time import time
-from urllib.parse import quote
 
 from fastapi import HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from Backend import StartTime, __version__, db
 from Backend.fastapi.routes.stream_routes import _streamer_by_client
@@ -25,11 +27,13 @@ from Backend.helper.manual_add import resolve_telegram_message
 from Backend.helper.metadata import (
     fetch_selected_movie_metadata,
     fetch_selected_tv_metadata,
+    gradient_cover_path,
+    resolve_cover_url,
     search_movie_candidates,
     search_tv_candidates,
 )
 from Backend.helper.passwords import hash_password
-from Backend.helper.pyro import get_readable_time
+from Backend.helper.pyro import get_readable_file_size, get_readable_time
 from Backend.helper.scan_manager import dbcheck_manager, scan_manager
 from Backend.helper.settings_manager import SettingsManager
 from Backend.helper.split_files import strip_part_suffix
@@ -71,6 +75,14 @@ async def get_system_stats_api():
         }
 
 
+#----- Expand stored gradient cover paths into full URLs for UI responses
+def _resolve_covers(items) -> None:
+    for item in items or []:
+        for key in ("poster", "backdrop"):
+            if item.get(key):
+                item[key] = resolve_cover_url(item[key])
+
+
 #----- Media management
 async def list_media_api(
     media_type: str = Query("movie", regex="^(movie|tv)$"),
@@ -79,25 +91,24 @@ async def list_media_api(
     search: str = Query("", max_length=100)
 ):
     try:
+        key = "movies" if media_type == "movie" else "tv_shows"
         if search:
             result = await db.search_documents(search, page, page_size)
             filtered_results = [item for item in result['results'] if item.get('media_type') == media_type]
             total_filtered = len(filtered_results)
             start_index = (page - 1) * page_size
-            end_index = start_index + page_size
-            paged_results = filtered_results[start_index:end_index]
-            
-            return {
+            resp = {
                 "total_count": total_filtered,
                 "current_page": page,
                 "total_pages": (total_filtered + page_size - 1) // page_size,
-                "movies" if media_type == "movie" else "tv_shows": paged_results
+                key: filtered_results[start_index:start_index + page_size],
             }
+        elif media_type == "movie":
+            resp = await db.sort_movies([], page, page_size)
         else:
-            if media_type == "movie":
-                return await db.sort_movies([], page, page_size)
-            else:
-                return await db.sort_tv_shows([], page, page_size)
+            resp = await db.sort_tv_shows([], page, page_size)
+        _resolve_covers(resp.get(key))
+        return resp
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -828,20 +839,13 @@ _PLACEHOLDER_DESCRIPTIONS = [
 ]
 
 
-#----- Gradient placeholder cover for titles without artwork
-def _gradient_cover(title: str, portrait: bool = False) -> str:
-    text = quote((title or "Media").strip() or "Media")
-    url = f"https://gradient-cover-api.vercel.app/api/image?text={text}&badge="
-    return f"{url}&orientation=portrait" if portrait else url
-
-
-#----- Fill empty optional metadata with random values and gradient artwork
+#----- Fill empty optional metadata with random values and a gradient cover path
 def _fill_placeholder_metadata(meta: dict) -> None:
     title = meta.get("title") or "Media"
     if not meta.get("poster"):
-        meta["poster"] = _gradient_cover(title, portrait=True)
+        meta["poster"] = gradient_cover_path(title, portrait=True)
     if not meta.get("backdrop"):
-        meta["backdrop"] = _gradient_cover(title)
+        meta["backdrop"] = gradient_cover_path(title)
     if not meta.get("genres"):
         meta["genres"] = random.sample(_PLACEHOLDER_GENRES, random.randint(1, 3))
     if not meta.get("rate"):
@@ -922,12 +926,11 @@ async def manual_add_media_api(payload: dict) -> dict:
         base["imdb_id"] = f"tg{abs(int(base['tmdb_id']))}"
     _fill_placeholder_metadata(base)
 
-    #----- Use the file's own thumbnail as artwork when available
-    base_url = SettingsManager.current().base_url
+    #----- Store the file thumbnail as a base-relative path so it survives base_url changes
     thumb_url = ""
-    if primary.get("has_thumb") and base_url:
+    if primary.get("has_thumb"):
         thumb_enc = await encode_string({"chat_id": int(primary["chat_id"]), "msg_id": int(primary["msg_id"])})
-        thumb_url = f"{base_url}/thumb/{thumb_enc}"
+        thumb_url = f"/thumb/{thumb_enc}"
 
     #----- Split parts share one quality entry via a common group key
     group_key = f"manual:{primary['chat_id']}:{quality}:{secrets.token_hex(6)}" if is_split else None
@@ -1104,6 +1107,7 @@ async def get_custom_catalog_items_api(
         data = await db.get_custom_catalog_items(catalog_id, media_type, page, page_size)
         if not data.get("catalog"):
             raise HTTPException(status_code=404, detail="Catalog not found.")
+        _resolve_covers(data.get("items"))
         return data
     except HTTPException:
         raise
@@ -1446,3 +1450,104 @@ async def purge_dead_links_api(payload: dict | None = None) -> dict:
         result = await dbcheck_manager.purge()
 
     return {"status": "success" if result.get("ok") else "error", **result}
+
+
+
+#----- ── System & Maintenance (web replacements for /stats, /log, /restart) ──
+
+LOG_FILE = "log.txt"
+
+
+#----- Aggregate content + system metrics across all storage DBs (was /stats)
+async def get_db_stats_api() -> dict:
+    try:
+        total_movies = total_tv = total_episodes = total_streams = total_db_size = 0
+
+        for i in range(1, db.current_db_index + 1):
+            storage = db.dbs.get(f"storage_{i}")
+            if storage is None:
+                continue
+
+            total_movies += await storage["movie"].count_documents({})
+            async for movie in storage["movie"].find({}, {"telegram": 1}):
+                total_streams += len(movie.get("telegram", []))
+
+            total_tv += await storage["tv"].count_documents({})
+            async for show in storage["tv"].find({}, {"seasons": 1}):
+                for season in show.get("seasons", []):
+                    for episode in season.get("episodes", []):
+                        total_episodes += 1
+                        total_streams += len(episode.get("telegram", []))
+
+            try:
+                total_db_size += (await storage.command("dbStats")).get("dataSize", 0)
+            except Exception:
+                pass
+
+        return {
+            "status": "success",
+            "data": {
+                "version": __version__,
+                "movies": total_movies,
+                "tv_shows": total_tv,
+                "episodes": total_episodes,
+                "streams": total_streams,
+                "uptime": get_readable_time(int(time() - StartTime)),
+                "db_size": get_readable_file_size(total_db_size),
+                "storage_dbs": db.current_db_index,
+                "auth_channels": len(SettingsManager.current().auth_channels),
+            },
+        }
+    except Exception as e:
+        LOGGER.error(f"[Stats] Error: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+#----- Lightweight liveness probe; start_time changes on every boot (restart detection)
+async def health_api() -> dict:
+    return {"status": "ok", "start_time": StartTime, "version": __version__}
+
+
+#----- Tail of the log file for the web viewer (was /log)
+async def get_logs_api(lines: int = 300) -> dict:
+    path = os.path.abspath(LOG_FILE)
+    if not os.path.exists(path):
+        return {"status": "error", "message": "Log file not found.", "log": ""}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            tail = f.readlines()[-max(1, min(lines, 2000)):]
+        return {"status": "success", "log": "".join(tail)}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "log": ""}
+
+
+#----- Download the raw log file (was /log document)
+async def download_logs_api():
+    path = os.path.abspath(LOG_FILE)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Log file not found.")
+    return FileResponse(path, filename="log.txt", media_type="text/plain")
+
+
+#----- Run the updater then re-exec the app; runs after the HTTP response is flushed
+async def _perform_restart(delay: float = 1.0) -> None:
+    await asyncio.sleep(delay)
+    try:
+        LOGGER.info("Web-triggered restart: running updater...")
+        proc = await asyncio.create_subprocess_exec("uv", "run", "update.py")
+        await proc.wait()
+    except Exception as e:
+        LOGGER.error(f"Restart updater failed: {e}")
+
+    uv_path = shutil.which("uv")
+    if not uv_path:
+        LOGGER.error("Restart aborted: uv not found in PATH.")
+        return
+    LOGGER.info("Web-triggered restart: re-executing app...")
+    os.execl(uv_path, uv_path, "run", "-m", "Backend")
+
+
+#----- Trigger a restart from the web (was /restart)
+async def restart_app_api() -> dict:
+    asyncio.create_task(_perform_restart())
+    return {"status": "success", "message": "Restart initiated — the server will be back shortly."}
